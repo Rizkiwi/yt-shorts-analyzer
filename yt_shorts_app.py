@@ -210,7 +210,7 @@ CSV_FIELDS = [
     "collected_at","video_id","title","channel_id","channel_title",
     "published_at","duration_seconds","view_count","like_count",
     "comment_count","category_id","category_name","tags",
-    "description_snippet","thumbnail_url","video_url","search_keyword",
+    "description_snippet","thumbnail_url","video_url","search_keyword","is_shorts",
 ]
 DEFAULT_KEYWORDS = ["#shortsIndonesia","#viral","#trending","#fyp","#shortsvideo"]
 
@@ -239,6 +239,8 @@ TIPS = {
     "vhr":              "Views per Hour — jumlah view yang masuk per jam sejak video diupload.",
     "search_date":      "Filter tanggal upload saat pencarian ke YouTube API. Hanya video yang diupload dalam rentang ini yang akan dikembalikan. Berguna untuk cari konten baru atau konten dari periode tertentu.",
     "order_search":     "Urutan hasil pencarian dari YouTube. 'viewCount' = terpopuler, 'date' = terbaru, 'relevance' = paling relevan dengan keyword.",
+    "content_mode":     "Shorts: hanya video ≤60 detik (format vertikal YouTube Shorts). Semua Video: semua durasi pendek termasuk video biasa.",
+    "lang_filter":      "Filter bahasa judul video. Aktifkan untuk menyembunyikan video yang judulnya didominasi huruf non-Indonesia/Inggris atau terdeteksi sebagai konten luar.",
 }
 
 # ── Session state ──────────────────────────────────────────────────────────────
@@ -252,7 +254,39 @@ def parse_duration(iso: str) -> int:
     if not m: return 0
     return int(m.group(1) or 0)*3600 + int(m.group(2) or 0)*60 + int(m.group(3) or 0)
 
-def is_shorts(sec: int) -> bool: return 5 <= sec <= 180
+def is_shorts(sec: int) -> bool: return 5 <= sec <= 60
+
+def is_strict_shorts(video_id: str, dur: int) -> bool:
+    """Shorts sejati: durasi ≤60 detik. URL /shorts/ ID sudah pasti Shorts."""
+    return dur <= 60
+
+# Kata kunci channel/judul berita luar yang sering masuk
+FOREIGN_NEWS_BLOCKLIST = {
+    "bbc","cnn","reuters","bloomberg","aljazeera","al jazeera","fox news",
+    "abc news","nbc news","sky news","euronews","france24","dw news",
+    "the guardian","new york times","washington post","associated press",
+    "global news","channel news asia","cna","ndtv","times of india",
+    "hindustan times","the hindu","pak","pakistan","india today",
+    "wion","zee news","firstpost","republic tv","aaj tak",
+}
+
+def is_foreign_news(title: str, channel: str) -> bool:
+    """Return True kalau video kemungkinan berita luar negeri."""
+    combined = (title + " " + channel).lower()
+    return any(kw in combined for kw in FOREIGN_NEWS_BLOCKLIST)
+
+def has_indo_signal(title: str) -> bool:
+    """Cek apakah judul punya sinyal bahasa Indonesia/Melayu."""
+    indo_words = {
+        "yang","dan","di","ke","dari","ini","itu","dengan","untuk","ada",
+        "tidak","bisa","juga","sudah","akan","lebih","atau","tapi","agar",
+        "oleh","pada","saat","kita","kami","mereka","dalam","antara","setelah",
+        "video","berita","viral","trending","shorts","indonesia","jakarta",
+        "nggak","gak","nih","dong","sih","yuk","wkwk","mantap","keren",
+        "bagus","lucu","seru","gila","anjir","astaga","luar biasa",
+    }
+    words = set(re.findall(r"[a-zA-Z]+", title.lower()))
+    return bool(words & indo_words)
 
 def fmt_num(n) -> str:
     n = int(n)
@@ -301,26 +335,41 @@ def get_details(yt, video_ids):
             add_log(f"Detail gagal: {e}", "err")
     return out
 
-def parse_item(item, keyword, collected_at):
+def parse_item(item, keyword, collected_at, content_mode="shorts_only", filter_foreign=True):
     sn=item.get("snippet",{}); st_=item.get("statistics",{}); cd=item.get("contentDetails",{})
     dur=parse_duration(cd.get("duration","PT0S"))
-    if not is_shorts(dur): return None
+    title   = sn.get("title","")
+    channel = sn.get("channelTitle","")
+
+    # Filter durasi sesuai mode
+    if content_mode == "shorts_only":
+        if not is_shorts(dur): return None
+        video_url = f"https://www.youtube.com/shorts/{item['id']}"
+    else:  # all_short_videos: terima 5–180 detik
+        if not (5 <= dur <= 180): return None
+        video_url = f"https://www.youtube.com/watch?v={item['id']}"
+
+    # Filter berita luar
+    if filter_foreign and is_foreign_news(title, channel):
+        return None
+
     cat_id=sn.get("categoryId","")
     thumbs=sn.get("thumbnails",{})
     thumb=(thumbs.get("maxres") or thumbs.get("high") or thumbs.get("default") or {}).get("url","")
     return {
-        "collected_at":collected_at,"video_id":item["id"],"title":sn.get("title",""),
-        "channel_id":sn.get("channelId",""),"channel_title":sn.get("channelTitle",""),
+        "collected_at":collected_at,"video_id":item["id"],"title":title,
+        "channel_id":sn.get("channelId",""),"channel_title":channel,
         "published_at":sn.get("publishedAt",""),"duration_seconds":dur,
         "view_count":int(st_.get("viewCount",0)),"like_count":int(st_.get("likeCount",0)),
         "comment_count":int(st_.get("commentCount",0)),"category_id":cat_id,
         "category_name":CATEGORY_MAP.get(cat_id,"Unknown"),"tags":"|".join(sn.get("tags",[])),
         "description_snippet":sn.get("description","").replace("\n"," ")[:200],
-        "thumbnail_url":thumb,"video_url":f"https://www.youtube.com/shorts/{item['id']}",
+        "thumbnail_url":thumb,"video_url":video_url,
         "search_keyword":keyword,
+        "is_shorts": dur <= 60,
     }
 
-def run_collect(api_key, kw_configs, pub_after=None, pub_before=None, search_order="viewCount"):
+def run_collect(api_key, kw_configs, pub_after=None, pub_before=None, search_order="viewCount", content_mode="shorts_only", filter_foreign=True):
     yt=build_yt(api_key); collected_at=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     all_rows,seen_ids=[],set()
     date_info = ""
@@ -328,7 +377,9 @@ def run_collect(api_key, kw_configs, pub_after=None, pub_before=None, search_ord
         a = pub_after.strftime("%d %b %Y") if pub_after else "awal"
         b = pub_before.strftime("%d %b %Y") if pub_before else "sekarang"
         date_info = f" · 📅 {a} – {b}"
-    add_log(f"Mulai koleksi — {len(kw_configs)} keyword(s){date_info}","info")
+    mode_lbl = "Shorts ≤60s" if content_mode=="shorts_only" else "Semua Video Pendek"
+    foreign_lbl = " · 🌏 filter berita luar: ON" if filter_foreign else ""
+    add_log(f"Mulai koleksi — {len(kw_configs)} kw · {mode_lbl}{foreign_lbl}{date_info}","info")
     for cfg in kw_configs:
         kw,mr=cfg["keyword"],cfg["max_results"]
         add_log(f"→ Searching '{kw}' (max {mr}) ...","info")
@@ -338,7 +389,7 @@ def run_collect(api_key, kw_configs, pub_after=None, pub_before=None, search_ord
         add_log(f"  {len(new_ids)} video ID, ambil detail ...","info")
         items=get_details(yt,new_ids); count=0
         for item in items:
-            row=parse_item(item,kw,collected_at)
+            row=parse_item(item,kw,collected_at,content_mode,filter_foreign)
             if row: all_rows.append(row); count+=1
         add_log(f"  ✓ {count} Shorts valid dari '{kw}'","ok")
         time.sleep(0.8)
@@ -485,6 +536,20 @@ with st.sidebar:
         if pub_after and pub_before:
             st.caption(f"📅 {pub_after.strftime('%d %b %Y')} – {pub_before.strftime('%d %b %Y')}")
 
+    # ── Content mode ─────────────────────────────────────────────────────────
+    st.markdown(f'<span class="sb-label">{tt("🎬 Tipe Konten", TIPS["content_mode"])}</span>', unsafe_allow_html=True)
+    content_mode_label = st.radio(
+        "mode", ["Shorts saja (≤60 detik)", "Semua video pendek (≤3 menit)"],
+        label_visibility="collapsed",
+    )
+    content_mode = "shorts_only" if "Shorts" in content_mode_label else "all_short_videos"
+
+    # ── Foreign news filter ───────────────────────────────────────────────────
+    st.markdown(f'<span class="sb-label">{tt("🌏 Filter Konten Luar", TIPS["lang_filter"])}</span>', unsafe_allow_html=True)
+    filter_foreign = st.toggle("Sembunyikan berita luar negeri", value=True)
+    if filter_foreign:
+        st.caption("Menyembunyikan channel: BBC, CNN, Reuters, Al Jazeera, NDTV, dll.")
+
     # ── Search order ─────────────────────────────────────────────────────────
     st.markdown(f'<span class="sb-label">{tt("↕ Urutan Hasil", TIPS["order_search"])}</span>', unsafe_allow_html=True)
     search_order = st.selectbox(
@@ -518,21 +583,25 @@ if run_btn:
     st.session_state.logs=[]; st.session_state.results_df=pd.DataFrame()
     prog=st.progress(0,text="Menghubungi YouTube API...")
     with st.spinner(""):
-        df_result=run_collect(api_key_input,kw_configs,pub_after,pub_before,search_order)
+        df_result=run_collect(api_key_input,kw_configs,pub_after,pub_before,search_order,content_mode,filter_foreign)
         prog.progress(100,text="✓ Selesai!")
     st.session_state.results_df=df_result
 
 if st.session_state.logs:
     st.markdown(f'<div class="log-box">{"<br>".join(st.session_state.logs)}</div>', unsafe_allow_html=True)
     # Tampilkan info parameter pencarian yang dipakai
-    if pub_after or pub_before or search_order != "viewCount":
+    show_info = pub_after or pub_before or search_order != "viewCount" or content_mode != "shorts_only" or not filter_foreign
+    if show_info:
         info_parts = []
+        mode_tag = "🎬 Shorts ≤60s" if content_mode == "shorts_only" else "🎬 Semua video pendek"
+        info_parts.append(mode_tag)
         if pub_after or pub_before:
             a = pub_after.strftime("%d %b %Y") if pub_after else "awal"
             b = pub_before.strftime("%d %b %Y") if pub_before else "sekarang"
-            info_parts.append(f"📅 Diupload: {a} – {b}")
-        order_lbl = {"viewCount":"👁 Terbanyak ditonton","date":"🕐 Terbaru","relevance":"🔍 Paling relevan"}.get(search_order,"")
-        if order_lbl: info_parts.append(f"↕ Urutan: {order_lbl}")
+            info_parts.append(f"📅 {a} – {b}")
+        order_lbl = {"viewCount":"👁 Terpopuler","date":"🕐 Terbaru","relevance":"🔍 Relevan"}.get(search_order,"")
+        if order_lbl: info_parts.append(f"↕ {order_lbl}")
+        if not filter_foreign: info_parts.append("🌏 Berita luar: tidak difilter")
         st.markdown(f'''<div style="background:#F0F4FF;border-radius:8px;padding:7px 14px;font-size:0.8rem;
         color:#3B4BAF;margin-bottom:0.5rem;">🔍 Parameter pencarian: {" · ".join(info_parts)}</div>''',
         unsafe_allow_html=True)
