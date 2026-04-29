@@ -385,8 +385,7 @@ with st.sidebar:
 
     # API Key
     st.markdown('<span class="sb-label">🔑 API Key</span>', unsafe_allow_html=True)
-    api_key_input = os.getenv("YOUTUBE_API_KEY") or st.secrets.get("YOUTUBE_API_KEY", "")
-    # api_key_input = os.getenv("YOUTUBE_API_KEY","")
+    api_key_input = os.getenv("YOUTUBE_API_KEY","")
     override = st.text_input("override", value="", type="password",
                              placeholder="Override .env (opsional)", label_visibility="collapsed")
     if override.strip(): api_key_input = override.strip()
@@ -439,6 +438,26 @@ with st.sidebar:
     <div style="font-size:0.7rem;color:#999;">Search=100 unit/kw · Detail=1 unit/video</div>
     """, unsafe_allow_html=True)
 
+    # Date filter — hanya muncul kalau sudah ada data CSV
+    date_start = date_end = None
+    if os.path.isfile(OUTPUT_FILE):
+        try:
+            _hist = pd.read_csv(OUTPUT_FILE, usecols=["published_at"])
+            _hist["published_dt"] = pd.to_datetime(_hist["published_at"], errors="coerce", utc=True)
+            _hist = _hist.dropna(subset=["published_dt"])
+            if not _hist.empty:
+                _min = _hist["published_dt"].dt.date.min()
+                _max = _hist["published_dt"].dt.date.max()
+                st.markdown(f'<span class="sb-label">{tt("📅 Filter Tanggal Publish", "Filter berdasarkan tanggal video diupload ke YouTube. Berlaku untuk semua analisis.")}</span>', unsafe_allow_html=True)
+                fd1, fd2 = st.columns(2)
+                date_start = fd1.date_input("Dari", value=_min, min_value=_min, max_value=_max, label_visibility="visible")
+                date_end   = fd2.date_input("Sampai", value=_max, min_value=_min, max_value=_max, label_visibility="visible")
+                if date_start > date_end:
+                    st.markdown('<span style="color:#f44336;font-size:0.75rem;">⚠ Tanggal mulai &gt; akhir</span>', unsafe_allow_html=True)
+                    date_start = date_end = None
+        except Exception:
+            pass
+
     st.markdown("---")
     run_btn = st.button("▶  Mulai Koleksi", use_container_width=True, type="primary",
                         disabled=not api_key_input or not st.session_state.keywords)
@@ -477,6 +496,38 @@ raw_df = st.session_state.results_df
 
 if not raw_df.empty:
     df = enrich_df(raw_df)
+
+    # ── Terapkan filter tanggal ───────────────────────────────────────────────
+    total_before = len(df)
+    if date_start and date_end:
+        mask = (
+            (df["published_dt"].dt.date >= date_start) &
+            (df["published_dt"].dt.date <= date_end)
+        )
+        df = df[mask]
+        filtered_out = total_before - len(df)
+        date_info_color = "#1b6b3a" if len(df) > 0 else "#a31515"
+        date_bg_color   = "#e6f4ec" if len(df) > 0 else "#fde8e8"
+        st.markdown(f"""
+        <div style="background:{date_bg_color};border-radius:8px;padding:8px 14px;
+        display:flex;align-items:center;justify-content:space-between;margin-bottom:0.8rem;font-size:0.82rem;">
+          <span style="color:{date_info_color};font-weight:600;">
+            📅 Filter: {date_start.strftime('%d %b %Y')} – {date_end.strftime('%d %b %Y')}
+          </span>
+          <span style="color:{date_info_color};">
+            {len(df):,} video · {filtered_out} disembunyikan
+          </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if df.empty:
+        st.markdown("""
+        <div style="text-align:center;padding:3rem 2rem;background:#FFF8F8;border:1px solid #FFE0E0;border-radius:12px;">
+          <div style="font-size:1.8rem;margin-bottom:0.5rem;">🔍</div>
+          <div style="font-weight:700;color:#a31515;margin-bottom:4px;">Tidak ada video di rentang tanggal ini</div>
+          <div style="color:#606060;font-size:0.85rem;">Coba perlebar rentang tanggal di sidebar</div>
+        </div>""", unsafe_allow_html=True)
+        st.stop()
 
     # Metric cards row
     c1,c2,c3,c4,c5 = st.columns(5)
