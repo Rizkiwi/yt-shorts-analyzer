@@ -237,6 +237,8 @@ TIPS = {
     "category":         "Kategori konten yang ditetapkan kreator saat upload di YouTube.",
     "best_time":        "Dihitung dari rata-rata views tertinggi per slot waktu dalam dataset ini — bukan riset global YouTube.",
     "vhr":              "Views per Hour — jumlah view yang masuk per jam sejak video diupload.",
+    "search_date":      "Filter tanggal upload saat pencarian ke YouTube API. Hanya video yang diupload dalam rentang ini yang akan dikembalikan. Berguna untuk cari konten baru atau konten dari periode tertentu.",
+    "order_search":     "Urutan hasil pencarian dari YouTube. 'viewCount' = terpopuler, 'date' = terbaru, 'relevance' = paling relevan dengan keyword.",
 }
 
 # ── Session state ──────────────────────────────────────────────────────────────
@@ -265,15 +267,20 @@ def add_log(msg: str, kind: str = "info"):
 
 def build_yt(k): return build("youtube","v3",developerKey=k)
 
-def search_shorts_api(yt, keyword, max_results):
+def search_shorts_api(yt, keyword, max_results, published_after=None, published_before=None, order="viewCount"):
     ids, fetched, pt = [], 0, None
+    extra = {}
+    if published_after:
+        extra["publishedAfter"]  = published_after.strftime("%Y-%m-%dT00:00:00Z")
+    if published_before:
+        extra["publishedBefore"] = published_before.strftime("%Y-%m-%dT23:59:59Z")
     while fetched < max_results:
         bs = min(50, max_results - fetched)
         try:
             resp = yt.search().list(
                 part="id", q=keyword, type="video", videoDuration="short",
-                regionCode=REGION_CODE, relevanceLanguage="id", order="viewCount",
-                maxResults=bs, pageToken=pt,
+                regionCode=REGION_CODE, relevanceLanguage="id", order=order,
+                maxResults=bs, pageToken=pt, **extra,
             ).execute()
             items = resp.get("items", [])
             ids.extend([i["id"]["videoId"] for i in items])
@@ -313,14 +320,19 @@ def parse_item(item, keyword, collected_at):
         "search_keyword":keyword,
     }
 
-def run_collect(api_key, kw_configs):
+def run_collect(api_key, kw_configs, pub_after=None, pub_before=None, search_order="viewCount"):
     yt=build_yt(api_key); collected_at=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     all_rows,seen_ids=[],set()
-    add_log(f"Mulai koleksi — {len(kw_configs)} keyword(s)","info")
+    date_info = ""
+    if pub_after or pub_before:
+        a = pub_after.strftime("%d %b %Y") if pub_after else "awal"
+        b = pub_before.strftime("%d %b %Y") if pub_before else "sekarang"
+        date_info = f" · 📅 {a} – {b}"
+    add_log(f"Mulai koleksi — {len(kw_configs)} keyword(s){date_info}","info")
     for cfg in kw_configs:
         kw,mr=cfg["keyword"],cfg["max_results"]
         add_log(f"→ Searching '{kw}' (max {mr}) ...","info")
-        ids=search_shorts_api(yt,kw,mr)
+        ids=search_shorts_api(yt,kw,mr,pub_after,pub_before,search_order)
         new_ids=[v for v in ids if v not in seen_ids]; seen_ids.update(new_ids)
         if not new_ids: add_log(f"  Tidak ada video baru untuk '{kw}'","warn"); continue
         add_log(f"  {len(new_ids)} video ID, ambil detail ...","info")
@@ -438,25 +450,48 @@ with st.sidebar:
     <div style="font-size:0.7rem;color:#999;">Search=100 unit/kw · Detail=1 unit/video</div>
     """, unsafe_allow_html=True)
 
-    # Date filter — hanya muncul kalau sudah ada data CSV
-    date_start = date_end = None
-    if os.path.isfile(OUTPUT_FILE):
-        try:
-            _hist = pd.read_csv(OUTPUT_FILE, usecols=["published_at"])
-            _hist["published_dt"] = pd.to_datetime(_hist["published_at"], errors="coerce", utc=True)
-            _hist = _hist.dropna(subset=["published_dt"])
-            if not _hist.empty:
-                _min = _hist["published_dt"].dt.date.min()
-                _max = _hist["published_dt"].dt.date.max()
-                st.markdown(f'<span class="sb-label">{tt("📅 Filter Tanggal Publish", "Filter berdasarkan tanggal video diupload ke YouTube. Berlaku untuk semua analisis.")}</span>', unsafe_allow_html=True)
-                fd1, fd2 = st.columns(2)
-                date_start = fd1.date_input("Dari", value=_min, min_value=_min, max_value=_max, label_visibility="visible")
-                date_end   = fd2.date_input("Sampai", value=_max, min_value=_min, max_value=_max, label_visibility="visible")
-                if date_start > date_end:
-                    st.markdown('<span style="color:#f44336;font-size:0.75rem;">⚠ Tanggal mulai &gt; akhir</span>', unsafe_allow_html=True)
-                    date_start = date_end = None
-        except Exception:
-            pass
+    # ── Search date filter (publishedAfter / publishedBefore) ───────────────
+    st.markdown(f'<span class="sb-label">{tt("📅 Rentang Tanggal Upload", TIPS["search_date"])}</span>', unsafe_allow_html=True)
+    today = datetime.date.today()
+    use_date_filter = st.toggle("Filter tanggal pencarian", value=False)
+    pub_after = pub_before = None
+    if use_date_filter:
+        preset_col, _ = st.columns([3,1])
+        preset = preset_col.selectbox(
+            "Preset", ["Custom", "7 hari terakhir", "30 hari terakhir", "3 bulan terakhir", "Tahun ini"],
+            label_visibility="collapsed",
+        )
+        if preset == "7 hari terakhir":
+            pub_after  = today - datetime.timedelta(days=7)
+            pub_before = today
+        elif preset == "30 hari terakhir":
+            pub_after  = today - datetime.timedelta(days=30)
+            pub_before = today
+        elif preset == "3 bulan terakhir":
+            pub_after  = today - datetime.timedelta(days=90)
+            pub_before = today
+        elif preset == "Tahun ini":
+            pub_after  = datetime.date(today.year, 1, 1)
+            pub_before = today
+        else:  # Custom
+            sd1, sd2 = st.columns(2)
+            pub_after  = sd1.date_input("Dari", value=today-datetime.timedelta(days=30),
+                                        max_value=today, label_visibility="visible")
+            pub_before = sd2.date_input("Sampai", value=today,
+                                        max_value=today, label_visibility="visible")
+            if pub_after > pub_before:
+                st.markdown('<span style="color:#f44336;font-size:0.75rem;">⚠ Tanggal mulai > akhir</span>', unsafe_allow_html=True)
+                pub_after = pub_before = None
+        if pub_after and pub_before:
+            st.caption(f"📅 {pub_after.strftime('%d %b %Y')} – {pub_before.strftime('%d %b %Y')}")
+
+    # ── Search order ─────────────────────────────────────────────────────────
+    st.markdown(f'<span class="sb-label">{tt("↕ Urutan Hasil", TIPS["order_search"])}</span>', unsafe_allow_html=True)
+    search_order = st.selectbox(
+        "order", ["viewCount", "date", "relevance"],
+        format_func=lambda x: {"viewCount":"👁 Paling Banyak Ditonton","date":"🕐 Terbaru","relevance":"🔍 Paling Relevan"}[x],
+        label_visibility="collapsed",
+    )
 
     st.markdown("---")
     run_btn = st.button("▶  Mulai Koleksi", use_container_width=True, type="primary",
@@ -483,12 +518,24 @@ if run_btn:
     st.session_state.logs=[]; st.session_state.results_df=pd.DataFrame()
     prog=st.progress(0,text="Menghubungi YouTube API...")
     with st.spinner(""):
-        df_result=run_collect(api_key_input,kw_configs)
+        df_result=run_collect(api_key_input,kw_configs,pub_after,pub_before,search_order)
         prog.progress(100,text="✓ Selesai!")
     st.session_state.results_df=df_result
 
 if st.session_state.logs:
     st.markdown(f'<div class="log-box">{"<br>".join(st.session_state.logs)}</div>', unsafe_allow_html=True)
+    # Tampilkan info parameter pencarian yang dipakai
+    if pub_after or pub_before or search_order != "viewCount":
+        info_parts = []
+        if pub_after or pub_before:
+            a = pub_after.strftime("%d %b %Y") if pub_after else "awal"
+            b = pub_before.strftime("%d %b %Y") if pub_before else "sekarang"
+            info_parts.append(f"📅 Diupload: {a} – {b}")
+        order_lbl = {"viewCount":"👁 Terbanyak ditonton","date":"🕐 Terbaru","relevance":"🔍 Paling relevan"}.get(search_order,"")
+        if order_lbl: info_parts.append(f"↕ Urutan: {order_lbl}")
+        st.markdown(f'''<div style="background:#F0F4FF;border-radius:8px;padding:7px 14px;font-size:0.8rem;
+        color:#3B4BAF;margin-bottom:0.5rem;">🔍 Parameter pencarian: {" · ".join(info_parts)}</div>''',
+        unsafe_allow_html=True)
     st.markdown("")
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
@@ -497,28 +544,8 @@ raw_df = st.session_state.results_df
 if not raw_df.empty:
     df = enrich_df(raw_df)
 
-    # ── Terapkan filter tanggal ───────────────────────────────────────────────
-    total_before = len(df)
-    if date_start and date_end:
-        mask = (
-            (df["published_dt"].dt.date >= date_start) &
-            (df["published_dt"].dt.date <= date_end)
-        )
-        df = df[mask]
-        filtered_out = total_before - len(df)
-        date_info_color = "#1b6b3a" if len(df) > 0 else "#a31515"
-        date_bg_color   = "#e6f4ec" if len(df) > 0 else "#fde8e8"
-        st.markdown(f"""
-        <div style="background:{date_bg_color};border-radius:8px;padding:8px 14px;
-        display:flex;align-items:center;justify-content:space-between;margin-bottom:0.8rem;font-size:0.82rem;">
-          <span style="color:{date_info_color};font-weight:600;">
-            📅 Filter: {date_start.strftime('%d %b %Y')} – {date_end.strftime('%d %b %Y')}
-          </span>
-          <span style="color:{date_info_color};">
-            {len(df):,} video · {filtered_out} disembunyikan
-          </span>
-        </div>
-        """, unsafe_allow_html=True)
+    # Filter tanggal sudah diterapkan saat pencarian (publishedAfter/Before di API)
+    # Tidak perlu filter post-collect
 
     if df.empty:
         st.markdown("""
