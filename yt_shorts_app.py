@@ -385,7 +385,8 @@ with st.sidebar:
 
     # API Key
     st.markdown('<span class="sb-label">🔑 API Key</span>', unsafe_allow_html=True)
-    api_key_input = os.getenv("YOUTUBE_API_KEY","")
+    api_key_input = os.getenv("YOUTUBE_API_KEY") or st.secrets.get("YOUTUBE_API_KEY", "")
+    # api_key_input = os.getenv("YOUTUBE_API_KEY","")
     override = st.text_input("override", value="", type="password",
                              placeholder="Override .env (opsional)", label_visibility="collapsed")
     if override.strip(): api_key_input = override.strip()
